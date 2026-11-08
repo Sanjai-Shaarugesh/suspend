@@ -7,8 +7,8 @@
         "Version": "1.5",
         "Category": "System Information",
         "License": "GPL-2.0+",
-        "Website": "https://github.com/Sanjai-Shaarugesh/suspend",
-        "BugReportUrl": "https://github.com/Sanjai-Shaarugesh/suspend/issues",
+        "Website": "https://github.com/YOUR_GITHUB_USER/suspend-widget",
+        "BugReportUrl": "https://github.com/YOUR_GITHUB_USER/suspend-widget/issues",
         "Authors": [{ "Name": "sanjai shaarugesh" }]
     },
     "KPackageStructure": "Plasma/Applet",
