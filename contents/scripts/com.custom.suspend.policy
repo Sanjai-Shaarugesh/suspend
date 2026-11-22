@@ -1,0 +1,53 @@
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<policyconfig>
+    <vendor>Suspend widget</vendor>
+    <vendor_url>https://github.com/Sanjai-Shaarugesh/suspend</vendor_url>
+    <icon_name>suspend-widget-on</icon_name>
+
+    <action id="com.custom.suspend.install">
+        <description>Install Suspend widget components</description>
+        <message>Suspend widget needs administrator access to install the necessary packages and files.</message>
+
+        <defaults>
+            <allow_any>auth_admin</allow_any>
+            <allow_inactive>auth_admin</allow_inactive>
+            <allow_active>auth_admin</allow_active>
+        </defaults>
+
+        <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/com.custom.suspend/suspend-installer</annotate>
+        <annotate key="org.freedesktop.policykit.exec.argv1">install-root</annotate>
+    </action>
+
+    <action id="com.custom.suspend.disable-sleep">
+        <description>Disable system sleep</description>
+        <message>The Suspend widget wants to disable system sleep. Authentication is required.</message>
+
+        <defaults>
+            <allow_any>auth_admin</allow_any>
+            <allow_inactive>auth_admin</allow_inactive>
+            <allow_active>auth_admin</allow_active>
+        </defaults>
+
+        <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/com.custom.suspend/suspend-helper</annotate>
+        <annotate key="org.freedesktop.policykit.exec.argv1">disable-sleep</annotate>
+    </action>
+
+    <action id="com.custom.suspend.enable-sleep">
+        <description>Enable system sleep</description>
+        <message>The Suspend widget wants to enable system sleep. Authentication is required.</message>
+
+        <defaults>
+            <allow_any>auth_admin</allow_any>
+            <allow_inactive>auth_admin</allow_inactive>
+            <allow_active>auth_admin</allow_active>
+        </defaults>
+
+        <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/com.custom.suspend/suspend-helper</annotate>
+        <annotate key="org.freedesktop.policykit.exec.argv1">enable-sleep</annotate>
+    </action>
+</policyconfig>

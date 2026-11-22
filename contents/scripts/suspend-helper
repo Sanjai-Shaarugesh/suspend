@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Privileged helper for the Suspend widget (com.custom.suspend).
+# Runs as root through pkexec only. Accepts exactly:
+#   suspend-helper disable-sleep [mode]   (widget ON)
+#   suspend-helper enable-sleep  [mode]   (widget OFF)
+set -Eeuo pipefail
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+RULE='/etc/polkit-1/rules.d/00-com.custom.suspend.rules'
+RULE_SOURCE='/usr/local/share/com.custom.suspend/suspend-sleep.rules'
+STATE_DIR='/var/lib/com.custom.suspend'
+STATE="$STATE_DIR/state"
+
+TARGETS=(
+    sleep.target
+    suspend.target
+    hibernate.target
+    hybrid-sleep.target
+)
+
+[[ "$EUID" -eq 0 ]] || {
+    echo "suspend-helper must run as root." >&2
+    exit 1
+}
+
+detect_init() {
+    [[ -d /run/systemd/system ]] && {
+        echo systemd
+        return
+    }
+
+    case "$(cat /proc/1/comm 2>/dev/null || true)" in
+        openrc-init) echo openrc; return ;;
+        dinit) echo dinit; return ;;
+        runit|runit-init) echo runit; return ;;
+        s6-svscan|s6-linux-init*) echo s6; return ;;
+    esac
+
+    if [[ -d /run/openrc ]]; then
+        echo openrc
+    elif [[ -S /run/dinitctl || -x /usr/bin/dinitctl || -x /bin/dinitctl ]]; then
+        echo dinit
+    elif [[ -d /run/runit || -d /etc/runit/runsvdir ]]; then
+        echo runit
+    elif [[ -d /run/s6 || -d /run/s6-linux-init-container ]]; then
+        echo s6
+    else
+        echo unknown
+    fi
+}
+
+write_state() {
+    install -d -m 755 "$STATE_DIR"
+    printf '%s\n' "$1" > "$STATE.tmp"
+    chmod 644 "$STATE.tmp"
+    mv -f "$STATE.tmp" "$STATE"
+}
+
+ACT="${1:-}"
+MODE="${2:-auto}"
+
+case "$MODE" in
+    auto) MODE="$(detect_init)" ;;
+    systemd|openrc|runit|dinit|s6|unknown) ;;
+    *)
+        echo "Unsupported init system: $MODE" >&2
+        exit 2
+        ;;
+esac
+
+if [[ "$MODE" == systemd ]]; then
+    METHOD=systemd
+else
+    METHOD=elogind
+fi
+
+case "$ACT" in
+    disable-sleep)
+        if [[ "$METHOD" == systemd ]]; then
+            systemctl mask "${TARGETS[@]}"
+        else
+            [[ -f "$RULE_SOURCE" ]] || {
+                echo "Bundled Polkit rule is missing. Re-run install.sh." >&2
+                exit 1
+            }
+            install -D -m 644 "$RULE_SOURCE" "$RULE"
+        fi
+        write_state on
+        ;;
+
+    enable-sleep)
+        if [[ "$METHOD" == systemd ]]; then
+            systemctl unmask "${TARGETS[@]}"
+        else
+            rm -f "$RULE"
+        fi
+        write_state off
+        ;;
+
+    *)
+        echo "Usage: suspend-helper disable-sleep|enable-sleep [mode]" >&2
+        exit 2
+        ;;
+esac

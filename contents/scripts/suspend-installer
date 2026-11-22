@@ -1,0 +1,18 @@
+#!/bin/sh
+# Fixed-path entry point for pkexec, so Polkit can show a clear message
+# (see the com.custom.suspend.install action in the policy file).
+#
+#   suspend-installer install-root <pkgdir>
+#
+# It runs the setup script from the widget package as root. It is only
+# ever started after the user has authenticated.
+[ "$1" = install-root ] || { echo "Usage: suspend-installer install-root <pkgdir>" >&2; exit 2; }
+
+case "$2" in
+    /*) ;;
+    *) echo "Invalid package directory: $2" >&2; exit 2 ;;
+esac
+
+[ -f "$2/contents/scripts/suspend-setup" ] || { echo "Invalid package directory: $2" >&2; exit 2; }
+
+exec bash "$2/contents/scripts/suspend-setup" install-root "$2"

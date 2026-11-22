@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RULE='/etc/polkit-1/rules.d/00-com.custom.suspend.rules'
+HELPER='/usr/local/libexec/com.custom.suspend/suspend-helper'
+STATE='/var/lib/com.custom.suspend/state'
+
+TARGETS=(
+    sleep.target
+    suspend.target
+    hibernate.target
+    hybrid-sleep.target
+)
+
+# Run pkexec so that the desktop's graphical authentication agent is used,
+# even when this was started from a terminal. Without this, pkexec falls
+# back to a text prompt on the inherited terminal and fails with
+# "unexpected EOF while reading from controlling terminal".
+exec_pkexec() {
+    local help
+    help="$(pkexec --help 2>&1 || true)"
+
+    if [[ "$help" == *--disable-internal-agent* ]]; then
+        exec pkexec --disable-internal-agent "$@" </dev/null
+    fi
+
+    if command -v setsid >/dev/null 2>&1; then
+        help="$(setsid --help 2>&1 || true)"
+        if [[ "$help" == *--wait* ]]; then
+            exec setsid --wait pkexec "$@" </dev/null
+        fi
+    fi
+
+    exec pkexec "$@" </dev/null
+}
+
+detect_init() {
+    [[ -d /run/systemd/system ]] && {
+        echo systemd
+        return
+    }
+
+    case "$(cat /proc/1/comm 2>/dev/null || true)" in
+        openrc-init) echo openrc; return ;;
+        dinit) echo dinit; return ;;
+        runit|runit-init) echo runit; return ;;
+        s6-svscan|s6-linux-init*) echo s6; return ;;
+    esac
+
+    if [[ -d /run/openrc ]]; then
+        echo openrc
+    elif [[ -S /run/dinitctl || -x /usr/bin/dinitctl || -x /bin/dinitctl ]]; then
+        echo dinit
+    elif [[ -d /run/runit || -d /etc/runit/runsvdir ]]; then
+        echo runit
+    elif [[ -d /run/s6 || -d /run/s6-linux-init-container ]]; then
+        echo s6
+    else
+        echo unknown
+    fi
+}
+
+ACT="${1:-}"
+MODE="${2:-auto}"
+
+[[ "$MODE" == auto ]] && MODE="$(detect_init)"
+
+case "$MODE" in
+    systemd)
+        METHOD=systemd
+        ;;
+    openrc|runit|dinit|s6|unknown)
+        METHOD=elogind
+        ;;
+    *)
+        echo "Unsupported init system: $MODE" >&2
+        exit 2
+        ;;
+esac
+
+run_helper() {
+    [[ -x "$HELPER" ]] || {
+        echo "Helper is missing. Re-run install.sh." >&2
+        exit 1
+    }
+
+    command -v pkexec >/dev/null 2>&1 || {
+        echo "Polkit (pkexec) is not installed. Install your distribution's polkit package." >&2
+        exit 3
+    }
+
+    # pkexec exit codes: 126 = dialog dismissed, 127 = not authorized / error.
+    exec_pkexec "$HELPER" "$1" "$MODE"
+}
+
+case "$ACT" in
+    detect)
+        echo "$MODE ($METHOD)"
+        ;;
+
+    status)
+        if [[ "$METHOD" == systemd ]]; then
+            masked=0
+
+            for target in "${TARGETS[@]}"; do
+                state="$(systemctl is-enabled "$target" 2>/dev/null || true)"
+                [[ "$state" == masked || "$state" == masked-runtime ]] &&
+                    ((masked+=1))
+            done
+
+            if [[ "$masked" -eq "${#TARGETS[@]}" ]]; then
+                echo on
+            else
+                echo off
+            fi
+        else
+            # The state file is root-written but world-readable, so the
+            # polkit rules.d directory keeps its intended permissions.
+            if [[ -r "$STATE" ]]; then
+                if [[ "$(cat "$STATE")" == on ]]; then
+                    echo on
+                else
+                    echo off
+                fi
+            elif [[ -f "$RULE" ]]; then
+                echo on
+            else
+                echo off
+            fi
+        fi
+        ;;
+
+    on)
+        run_helper disable-sleep
+        ;;
+
+    off)
+        run_helper enable-sleep
+        ;;
+
+    *)
+        echo "Usage: suspend-backend status|on|off|detect [auto|systemd|openrc|runit|dinit|s6|unknown]" >&2
+        exit 2
+        ;;
+esac

@@ -6,5 +6,7 @@
   <group name="General">
     <entry name="initMode" type="String"><default>auto</default></entry>
     <entry name="iconScale" type="Int"><default>80</default></entry>
+    <!-- true once the setup popup has auto-opened; reset when setup is complete -->
+    <entry name="setupPrompted" type="Bool"><default>false</default></entry>
   </group>
 </kcfg>

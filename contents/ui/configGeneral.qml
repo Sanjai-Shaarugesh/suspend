@@ -6,43 +6,45 @@ import org.kde.kirigami as Kirigami
 Kirigami.FormLayout {
     id: page
 
-    property string cfg_initMode
-    property string cfg_initModeDefault
-    property int cfg_iconScale
-    property int cfg_iconScaleDefault
+    property string cfg_initMode: "auto"
+    property int cfg_iconScale: 80
 
     readonly property var modes: [
-        { v: "auto",    t: "Automatic (detect)" },
-        { v: "systemd", t: "systemd" },
-        { v: "openrc",  t: "OpenRC" },
-        { v: "runit",   t: "runit" },
-        { v: "dinit",   t: "dinit" },
-        { v: "s6",      t: "s6" }
+        { value: "auto", label: "Automatic (detect)" },
+        { value: "systemd", label: "systemd" },
+        { value: "openrc", label: "OpenRC / elogind" },
+        { value: "runit", label: "runit / elogind" },
+        { value: "dinit", label: "dinit / elogind" },
+        { value: "s6", label: "s6 / elogind" }
     ]
 
-    // cfg_initMode is filled in after the combo exists
     function syncCombo() {
-        var v = cfg_initMode === "" ? "auto" : cfg_initMode
-        for (var i = 0; i < modes.length; i++) {
-            if (modes[i].v === v) { combo.currentIndex = i; return }
+        const selected = cfg_initMode || "auto"
+        for (let i = 0; i < modes.length; ++i) {
+            if (modes[i].value === selected) {
+                combo.currentIndex = i
+                return
+            }
         }
         combo.currentIndex = 0
     }
-    onCfg_initModeChanged: syncCombo()
+
     Component.onCompleted: syncCombo()
+    onCfg_initModeChanged: syncCombo()
 
     QQC2.ComboBox {
         id: combo
         Kirigami.FormData.label: "Init system:"
-        model: page.modes.map(function (m) { return m.t })
-        onActivated: page.cfg_initMode = page.modes[currentIndex].v
+        textRole: "label"
+        model: page.modes
+        onActivated: page.cfg_initMode = page.modes[currentIndex].value
     }
 
     QQC2.Label {
-        Layout.maximumWidth: Kirigami.Units.gridUnit * 20
+        Layout.maximumWidth: Kirigami.Units.gridUnit * 24
         wrapMode: Text.WordWrap
-        opacity: 0.7
-        text: "systemd masks the sleep targets. OpenRC, runit, dinit and s6 use the elogind sleep.conf.d drop-in."
+        opacity: 0.75
+        text: "systemd masks its sleep targets. OpenRC, runit, dinit and s6 use a Polkit rule with elogind to deny sleep requests."
     }
 
     QQC2.SpinBox {

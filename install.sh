@@ -1,148 +1,494 @@
-#!/bin/bash
-# install.sh - sets up the system side of the suspend widget and installs the plasmoid.
-# usage: bash install.sh            install or update
-#        bash install.sh uninstall  remove everything
-set -e
+#!/usr/bin/env bash
+# KDE Plasma 6 Suspend Widget Installer
+# Works with systemd, OpenRC, runit, dinit and s6, and with sudo, doas or su.
+#
+# Install:    ./install.sh
+# Uninstall:  ./install.sh uninstall
+# Unattended: ./install.sh --yes     (accept the package-install prompts)
 
-ID=com.custom.suspend
-HERE="$(cd "$(dirname "$0")" && pwd)"
-PKG="$HERE/$ID"
-ICONS="$HOME/.local/share/icons/hicolor/scalable"
+set -Eeuo pipefail
 
-restart_shell() {
-    systemctl --user restart plasma-plasmashell.service 2>/dev/null \
-        || { kquitapp6 plasmashell; sleep 1; kstart plasmashell >/dev/null 2>&1 & }
+ID='com.custom.suspend'
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PKG="$HERE"
+
+BACKEND='/usr/local/bin/suspend-backend'
+COMPAT_DIR='/usr/local/bin/suspend'
+COMPAT_BACKEND="$COMPAT_DIR/backend"
+
+HELPER_DIR='/usr/local/libexec/com.custom.suspend'
+HELPER="$HELPER_DIR/suspend-helper"
+INSTALLER="$HELPER_DIR/suspend-installer"
+POLICY_DIR='/usr/share/polkit-1/actions'
+POLICY="$POLICY_DIR/com.custom.suspend.policy"
+STATE_DIR='/var/lib/com.custom.suspend'
+
+SHARE_DIR='/usr/local/share/com.custom.suspend'
+RULE_SOURCE="$SHARE_DIR/suspend-sleep.rules"
+RULE='/etc/polkit-1/rules.d/00-com.custom.suspend.rules'
+
+ICON_DIR='/usr/share/icons/hicolor/scalable/apps'
+ICON_NAME='suspend-widget-on'
+SYSTEM_ICON="$ICON_DIR/$ICON_NAME.svg"
+SYSTEM_APP_ICON="$ICON_DIR/$ID.svg"
+
+USER_ICON_DIR="$HOME/.local/share/icons/hicolor"
+
+ACTION=install
+ASSUME_YES=0
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARNING: $*" >&2; }
+info() { echo "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    cat <<'USAGE'
+Usage: ./install.sh [uninstall] [--yes]
+
+  uninstall   Remove the widget, backend, helper and Polkit files.
+  --yes, -y   Do not ask before installing missing packages.
+USAGE
 }
 
-if [ "$1" = uninstall ]; then
-    # leave sleep enabled on the way out
-    /usr/local/bin/suspend-backend off 2>/dev/null || true
-    kpackagetool6 -t Plasma/Applet -r "$ID" 2>/dev/null || true
-    sudo rm -f /usr/local/bin/suspend-backend \
-               /usr/local/libexec/suspend-helper \
-               /usr/share/polkit-1/actions/$ID.policy \
-               /usr/share/icons/hicolor/scalable/apps/$ID.svg \
-               /etc/elogind/sleep.conf.d/90-suspend-widget.conf
-    rm -f "$ICONS/actions/thunderbolt-symbolic.svg" \
-          "$ICONS/actions/suspend-widget-on.svg" \
-          "$ICONS/apps/$ID.svg"
-    restart_shell
-    echo "removed"
-    exit 0
-fi
+for arg in "$@"; do
+    case "$arg" in
+        uninstall) ACTION=uninstall ;;
+        -y|--yes) ASSUME_YES=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; fail "Unknown argument: $arg" ;;
+    esac
+done
 
-[ -f "$PKG/metadata.json" ] || { echo "can't find $PKG/metadata.json, run this from the repo folder" >&2; exit 1; }
-command -v kpackagetool6 >/dev/null || { echo "kpackagetool6 not found, is Plasma 6 installed?" >&2; exit 1; }
-command -v pkexec >/dev/null || echo "warning: pkexec not found, install polkit or the switch won't work" >&2
+# ---------------------------------------------------------------------
+# Privilege escalation: sudo, doas or su
+# ---------------------------------------------------------------------
 
-sudo mkdir -p /usr/local/libexec /usr/share/icons/hicolor/scalable/apps
+ESC=""
+for tool in sudo doas su; do
+    if have "$tool"; then
+        ESC="$tool"
+        break
+    fi
+done
 
-sudo tee /usr/local/libexec/suspend-helper >/dev/null <<'EOF_H'
-#!/bin/bash
-# runs as root via pkexec: suspend-helper <systemd|elogind> <on|off>
-T=(sleep.target suspend.target hibernate.target hybrid-sleep.target)
-D=/etc/elogind/sleep.conf.d
-F=$D/90-suspend-widget.conf
+root() {
+    case "$ESC" in
+        sudo) sudo "$@" ;;
+        doas) doas "$@" ;;
+        su)
+            local cmd
+            printf -v cmd '%q ' "$@"
+            su -c "$cmd" root
+            ;;
+        *) fail "None of sudo, doas or su was found." ;;
+    esac
+}
 
-case "$1:$2" in
-    systemd:on)  exec /usr/bin/systemctl mask   "${T[@]}" ;;
-    systemd:off) exec /usr/bin/systemctl unmask "${T[@]}" ;;
-    elogind:on)
-        mkdir -p "$D" || exit 1
-        printf '[Sleep]\nAllowSuspend=no\nAllowHibernation=no\nAllowSuspendThenHibernate=no\nAllowHybridSleep=no\n' > "$F"
-        ;;
-    elogind:off) rm -f "$F" ;;
-    *) echo "usage: $0 systemd|elogind on|off" >&2; exit 2 ;;
-esac
-EOF_H
-sudo chown root:root /usr/local/libexec/suspend-helper
-sudo chmod 755 /usr/local/libexec/suspend-helper
-sudo restorecon /usr/local/libexec/suspend-helper 2>/dev/null || true
+confirm() {
+    local reply
 
-sudo tee /usr/local/bin/suspend-backend >/dev/null <<'EOF_B'
-#!/bin/bash
-# suspend-backend status|on|off|detect [auto|systemd|openrc|runit|dinit|s6]
-TARGETS=(sleep.target suspend.target hibernate.target hybrid-sleep.target)
-CONF=/etc/elogind/sleep.conf.d/90-suspend-widget.conf
-HELPER=/usr/local/libexec/suspend-helper
+    (( ASSUME_YES )) && return 0
+    [[ -t 0 ]] || return 1
+
+    read -r -p "$1 [Y/n] " reply
+    [[ -z "$reply" || "$reply" == [Yy]* ]]
+}
+
+# ---------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------
 
 detect_init() {
-    [ -d /run/systemd/system ] && { echo systemd; return; }
-    case "$(cat /proc/1/comm 2>/dev/null)" in
-        dinit)                    echo dinit;  return ;;
-        runit|runit-init)         echo runit;  return ;;
-        s6-svscan|s6-linux-init*) echo s6;     return ;;
-        openrc-init)              echo openrc; return ;;
+    if [[ -d /run/systemd/system ]]; then
+        echo systemd
+        return
+    fi
+
+    case "$(cat /proc/1/comm 2>/dev/null || true)" in
+        openrc-init) echo openrc; return ;;
+        dinit) echo dinit; return ;;
+        runit|runit-init) echo runit; return ;;
+        s6-svscan|s6-linux-init*) echo s6; return ;;
     esac
-    # pid 1 is plain "init" on some distros
-    if   [ -d /run/openrc ];   then echo openrc
-    elif [ -S /run/dinitctl ]; then echo dinit
-    elif [ -d /run/runit ] || [ -d /etc/runit/runsvdir ]; then echo runit
-    elif [ -d /run/s6 ] || [ -d /run/s6-linux-init-container ]; then echo s6
-    else echo unknown
+
+    if [[ -d /run/openrc ]]; then
+        echo openrc
+    elif [[ -S /run/dinitctl || -x /usr/bin/dinitctl || -x /bin/dinitctl ]]; then
+        echo dinit
+    elif [[ -d /run/runit || -d /etc/runit/runsvdir ]]; then
+        echo runit
+    elif [[ -d /run/s6 || -d /run/s6-linux-init-container ]]; then
+        echo s6
+    else
+        echo unknown
     fi
 }
 
-act="$1"
-mode="${2:-auto}"
-[ "$mode" = auto ] && mode="$(detect_init)"
-[ "$mode" = systemd ] && method=systemd || method=elogind
+PM=""
+for candidate in pacman apt-get dnf yum zypper apk xbps-install emerge; do
+    if have "$candidate"; then
+        PM="$candidate"
+        break
+    fi
+done
 
-case "$act" in
-    detect) echo "$mode ($method)" ;;
-    status)
-        if [ "$method" = systemd ]; then
-            for t in "${TARGETS[@]}"; do
-                systemctl is-enabled "$t" 2>/dev/null | grep -qx masked || { echo off; exit 0; }
-            done
-            echo on
+# Package names per package manager. "agent" is the KDE Polkit
+# authentication agent.
+pkg_for() {
+    case "$1:$PM" in
+        polkit:pacman|polkit:dnf|polkit:yum|polkit:zypper|polkit:apk|polkit:xbps-install)
+            echo polkit ;;
+        polkit:apt-get)
+            if apt-cache show pkexec >/dev/null 2>&1; then
+                echo "polkitd pkexec"
+            else
+                echo policykit-1
+            fi
+            ;;
+        polkit:emerge) echo sys-auth/polkit ;;
+
+        python:pacman) echo python ;;
+        python:apt-get|python:dnf|python:yum|python:zypper|python:apk|python:xbps-install)
+            echo python3 ;;
+        python:emerge) echo dev-lang/python ;;
+
+        agent:pacman|agent:xbps-install) echo polkit-kde-agent ;;
+        agent:apt-get|agent:apk) echo polkit-kde-agent-1 ;;
+        agent:dnf|agent:yum) echo polkit-kde ;;
+        agent:zypper) echo polkit-kde-agent-6 ;;
+        agent:emerge) echo kde-plasma/polkit-kde-agent ;;
+
+        *) echo "" ;;
+    esac
+}
+
+install_pkgs() {
+    case "$PM" in
+        pacman) root pacman -S --needed --noconfirm "$@" ;;
+        apt-get)
+            root apt-get update
+            root apt-get install -y "$@"
+            ;;
+        dnf) root dnf install -y "$@" ;;
+        yum) root yum install -y "$@" ;;
+        zypper) root zypper --non-interactive install "$@" ;;
+        apk) root apk add "$@" ;;
+        xbps-install) root xbps-install -Sy "$@" ;;
+        emerge) root emerge --noreplace "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+find_agent() {
+    local f
+
+    for f in \
+        /usr/lib/polkit-kde-authentication-agent-1 \
+        /usr/lib64/polkit-kde-authentication-agent-1 \
+        /usr/libexec/polkit-kde-authentication-agent-1 \
+        /usr/libexec/kf6/polkit-kde-authentication-agent-1 \
+        /usr/lib/kf6/polkit-kde-authentication-agent-1 \
+        /usr/lib/*/libexec/polkit-kde-authentication-agent-1 \
+        /usr/lib/*/polkit-kde-authentication-agent-1 \
+        /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1 \
+        /usr/libexec/polkit-gnome-authentication-agent-1 \
+        /usr/lib/mate-polkit/polkit-mate-authentication-agent-1
+    do
+        [[ -x "$f" ]] && return 0
+    done
+
+    have lxqt-policykit-agent && return 0
+    have lxpolkit && return 0
+
+    pgrep -f 'polkit.*authentication.*agent|policykit-agent' \
+        >/dev/null 2>&1
+}
+
+ensure_dependencies() {
+    local missing=() names="" pkgs=() logical
+
+    have pkexec || missing+=(polkit)
+    have python3 || missing+=(python)
+
+    if (( ${#missing[@]} > 0 )); then
+        if [[ -z "$PM" ]]; then
+            fail "Missing: ${missing[*]}. No supported package manager was found. Install polkit (pkexec) and python3 manually."
+        fi
+
+        for logical in "${missing[@]}"; do
+            names+="$(pkg_for "$logical") "
+        done
+
+        read -ra pkgs <<< "$names"
+
+        echo "Required packages are missing: ${pkgs[*]}"
+
+        if ! confirm "Install them with $PM (administrator access needed)?"; then
+            fail "Required packages were not installed. Install them, then re-run (use --yes for unattended mode)."
+        fi
+
+        install_pkgs "${pkgs[@]}" ||
+            fail "Package installation failed. Install: ${pkgs[*]}"
+
+        hash -r
+
+        have pkexec || fail "pkexec is still missing after installation."
+        have python3 || fail "python3 is still missing after installation."
+    fi
+
+    # An authentication agent is needed for the password dialog.
+    if ! find_agent; then
+        local agent_pkg
+        agent_pkg="$(pkg_for agent)"
+
+        warn "No Polkit authentication agent found. The password prompt will not appear without one."
+
+        if [[ -n "$PM" && -n "$agent_pkg" ]]; then
+            if confirm "Try to install '$agent_pkg' with $PM?"; then
+                read -ra pkgs <<< "$agent_pkg"
+                install_pkgs "${pkgs[@]}" ||
+                    warn "Could not install '$agent_pkg'. Install the KDE Polkit agent for your distribution manually."
+            fi
+        fi
+    fi
+
+    # Informational checks. These never stop the installation.
+    if [[ "$INIT" != systemd ]]; then
+        if ! have loginctl && [[ ! -x /etc/init.d/elogind ]] &&
+           [[ ! -d /run/elogind ]]; then
+            warn "elogind was not detected. The sleep block relies on logind (org.freedesktop.login1). Install and start elogind."
+        fi
+    fi
+
+    if have pkaction; then
+        local ver
+        ver="$(pkaction --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)*' | head -n1 || true)"
+
+        if [[ "$ver" =~ ^0\.([0-9]+) ]] && (( BASH_REMATCH[1] < 106 )); then
+            warn "Polkit $ver is older than 0.106 and does not support the JavaScript rules this widget uses."
+        fi
+    fi
+}
+
+restart_shell() {
+    if have kquitapp6; then
+        kquitapp6 plasmashell >/dev/null 2>&1 || true
+        sleep 1
+
+        if have kstart; then
+            kstart plasmashell >/dev/null 2>&1 &
+        elif have kstart6; then
+            kstart6 plasmashell >/dev/null 2>&1 &
+        elif have setsid; then
+            setsid plasmashell >/dev/null 2>&1 &
         else
-            [ -f "$CONF" ] && grep -qx 'AllowSuspend=no' "$CONF" && echo on || echo off
-        fi ;;
-    on|off) pkexec "$HELPER" "$method" "$act" ;;
-    *) echo "usage: $0 status|on|off|detect [mode]" >&2; exit 2 ;;
-esac
-EOF_B
-sudo chmod 755 /usr/local/bin/suspend-backend
+            echo "Start Plasma Shell manually: plasmashell --replace"
+        fi
+    else
+        echo "Restart Plasma Shell manually to reload the widget."
+    fi
+}
 
-sudo tee /usr/share/polkit-1/actions/$ID.policy >/dev/null <<'EOF_P'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
-<policyconfig>
-  <vendor>Suspend Widget</vendor>
-  <action id="com.custom.suspend.toggle">
-    <description>Enable or disable system sleep</description>
-    <message>Suspend: authentication is required to turn sleep ON or OFF</message>
-    <icon_name>com.custom.suspend</icon_name>
-    <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin</allow_active>
-    </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/suspend-helper</annotate>
-  </action>
-</policyconfig>
-EOF_P
+# ---------------------------------------------------------------------
+# Preconditions
+# ---------------------------------------------------------------------
 
-# icons come from the package itself
-sudo cp "$PKG/contents/ui/suspend-widget-on.svg" /usr/share/icons/hicolor/scalable/apps/$ID.svg
-sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
-sudo systemctl restart polkit 2>/dev/null || true
+INIT="$(detect_init)"
 
-mkdir -p "$ICONS/actions" "$ICONS/apps"
-cp "$PKG/contents/ui/thunderbolt-symbolic.svg" "$PKG/contents/ui/suspend-widget-on.svg" "$ICONS/actions/"
-cp "$PKG/contents/ui/suspend-widget-on.svg" "$ICONS/apps/$ID.svg"
-gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+[[ "$(id -u)" -eq 0 ]] &&
+    fail "Run this installer as your normal desktop user, not as root."
 
-# build the zip from inside the package so metadata.json sits at its top level
+[[ -n "$ESC" ]] ||
+    fail "None of sudo, doas or su was found. One is required for the administrator steps."
+
 TMP="$(mktemp -d)"
-python3 -c "import shutil,sys; shutil.make_archive(sys.argv[1],'zip',sys.argv[2])" "$TMP/suspend-widget" "$PKG"
-kpackagetool6 -t Plasma/Applet -r "$ID" 2>/dev/null || true
-rm -rf "$HOME/.local/share/plasma/plasmoids/$ID"
-kpackagetool6 -t Plasma/Applet -i "$TMP/suspend-widget.zip"
-rm -rf "$TMP"
+trap 'rm -rf "$TMP"' EXIT
 
-kbuildsycoca6 >/dev/null 2>&1 || true
+# ---------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------
+
+if [[ "$ACTION" == uninstall ]]; then
+    if have kpackagetool6; then
+        kpackagetool6 -t Plasma/Applet -r "$ID" >/dev/null 2>&1 || true
+    fi
+
+    cat > "$TMP/priv-uninstall.sh" <<EOF
+set -u
+
+# Re-enable sleep first.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target || true
+fi
+
+rm -f '$RULE' '$POLICY' '$BACKEND' '$COMPAT_BACKEND' \\
+      '$SYSTEM_ICON' '$SYSTEM_APP_ICON'
+rm -rf '$SHARE_DIR' '$HELPER_DIR' '$STATE_DIR'
+rmdir '$COMPAT_DIR' >/dev/null 2>&1 || true
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+EOF
+
+    info "Administrator access is needed to remove the system files."
+    root bash "$TMP/priv-uninstall.sh"
+
+    rm -f \
+        "$USER_ICON_DIR/actions/thunderbolt-symbolic.svg" \
+        "$USER_ICON_DIR/actions/$ICON_NAME.svg" \
+        "$USER_ICON_DIR/apps/$ID.svg"
+
+    have gtk-update-icon-cache &&
+        gtk-update-icon-cache -f -t "$USER_ICON_DIR" >/dev/null 2>&1 || true
+
+    have kbuildsycoca6 &&
+        kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+
+    restart_shell
+
+    echo "Suspend widget uninstalled."
+    echo "Sleep has been re-enabled."
+    exit 0
+fi
+
+# ---------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------
+
+have kpackagetool6 ||
+    fail "KDE Plasma 6 (kpackagetool6) was not found. Install Plasma 6 first."
+
+for required in \
+    metadata.json \
+    contents/ui/main.qml \
+    contents/ui/suspend-widget-on.svg \
+    contents/ui/thunderbolt-symbolic.svg \
+    contents/scripts/suspend-backend \
+    contents/scripts/suspend-helper \
+    contents/scripts/suspend-installer \
+    contents/scripts/suspend-sleep.rules \
+    contents/scripts/com.custom.suspend.policy
+do
+    [[ -f "$PKG/$required" ]] || fail "Missing $required in $PKG."
+done
+
+echo "Detected init system:      $INIT"
+echo "Detected package manager:  ${PM:-none}"
+echo "Administrator access via:  $ESC"
+echo
+
+ensure_dependencies
+
+# All administrator work runs in ONE privileged step (one password prompt).
+cat > "$TMP/priv-install.sh" <<EOF
+set -Eeuo pipefail
+
+install -d -m 755 /usr/local/bin '$SHARE_DIR' '$COMPAT_DIR' \\
+    '$HELPER_DIR' '$ICON_DIR' '$POLICY_DIR' '$STATE_DIR'
+
+install -D -m 755 '$PKG/contents/scripts/suspend-backend' '$BACKEND'
+install -D -m 755 '$PKG/contents/scripts/suspend-helper' '$HELPER'
+install -D -m 755 '$PKG/contents/scripts/suspend-installer' '$INSTALLER'
+install -D -m 644 '$PKG/contents/scripts/com.custom.suspend.policy' '$POLICY'
+install -D -m 644 '$PKG/contents/scripts/suspend-sleep.rules' '$RULE_SOURCE'
+
+ln -sfn '$BACKEND' '$COMPAT_BACKEND'
+
+# World-readable state file that mirrors the current rule.
+if [ -f '$RULE' ]; then state=on; else state=off; fi
+printf '%s\n' "\$state" > '$STATE_DIR/state'
+chmod 644 '$STATE_DIR/state'
+
+install -m 644 '$PKG/contents/ui/suspend-widget-on.svg' '$SYSTEM_ICON'
+install -m 644 '$PKG/contents/ui/suspend-widget-on.svg' '$SYSTEM_APP_ICON'
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+EOF
+
+if [[ "$INIT" == openrc ]]; then
+    cat >> "$TMP/priv-install.sh" <<'EOF'
+
+if command -v rc-update >/dev/null 2>&1; then
+    if [ -x /etc/init.d/dbus ]; then
+        rc-update add dbus default >/dev/null 2>&1 || true
+        rc-service dbus start >/dev/null 2>&1 || true
+    fi
+    if [ -x /etc/init.d/elogind ]; then
+        rc-update add elogind boot >/dev/null 2>&1 || true
+        rc-service elogind start >/dev/null 2>&1 || true
+    fi
+    if [ -x /etc/init.d/polkit ]; then
+        rc-update add polkit default >/dev/null 2>&1 || true
+        rc-service polkit restart >/dev/null 2>&1 ||
+            rc-service polkit start >/dev/null 2>&1 || true
+    fi
+fi
+EOF
+fi
+
+info "Administrator access is needed to install the backend and Polkit files."
+root bash "$TMP/priv-install.sh"
+
+case "$INIT" in
+    runit|dinit|s6)
+        echo "$INIT detected. Ensure D-Bus, elogind and Polkit services are enabled and running."
+        ;;
+    unknown)
+        echo "Unknown init system. Ensure D-Bus, elogind and Polkit are available."
+        ;;
+esac
+
+# User-level icons
+mkdir -p "$USER_ICON_DIR/actions" "$USER_ICON_DIR/apps"
+
+install -m 644 "$PKG/contents/ui/thunderbolt-symbolic.svg" \
+    "$USER_ICON_DIR/actions/thunderbolt-symbolic.svg"
+install -m 644 "$PKG/contents/ui/suspend-widget-on.svg" \
+    "$USER_ICON_DIR/actions/$ICON_NAME.svg"
+install -m 644 "$PKG/contents/ui/suspend-widget-on.svg" \
+    "$USER_ICON_DIR/apps/$ID.svg"
+
+have gtk-update-icon-cache &&
+    gtk-update-icon-cache -f -t "$USER_ICON_DIR" >/dev/null 2>&1 || true
+
+# Widget package
+python3 - "$PKG" "$TMP/suspend-widget.zip" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+root = pathlib.Path(sys.argv[1])
+output = pathlib.Path(sys.argv[2])
+
+with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+    for path in root.rglob("*"):
+        if path.is_file():
+            archive.write(path, path.relative_to(root))
+PY
+
+kpackagetool6 -t Plasma/Applet -r "$ID" >/dev/null 2>&1 || true
+kpackagetool6 -t Plasma/Applet -i "$TMP/suspend-widget.zip"
+
+have kbuildsycoca6 &&
+    kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+
+echo
+echo "Suspend Widget Installed Successfully"
+echo
+echo "Init system: $INIT"
+echo "Backend:     $BACKEND"
+echo "Helper:      $HELPER"
+echo "Policy:      $POLICY"
+
+echo
+echo "Backend detect: $("$BACKEND" detect auto 2>&1 || true)"
+echo "Backend status: $("$BACKEND" status auto 2>&1 || true)"
+
+echo
+echo "Add Suspend from Plasma's Add Widgets menu."
+
 restart_shell
-echo "installed. right-click the panel > Add Widgets > search 'suspend'"

@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# Setup helper for the Suspend widget (com.custom.suspend).
+# The widget runs it with "bash" (no executable bit needed).
+#
+#   suspend-setup check <pkgdir>              report what is missing
+#   suspend-setup install <pkgdir>            install via pkexec (GUI password)
+#   suspend-setup install-terminal <pkgdir>   open a terminal and install there
+#   suspend-setup terminal-flow <pkgdir>      (runs inside that terminal)
+#   suspend-setup install-root <pkgdir>       (runs as root; do not call directly)
+#
+# <pkgdir> is the widget's package directory (contains contents/).
+set -u
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+BACKEND='/usr/local/bin/suspend-backend'
+COMPAT_DIR='/usr/local/bin/suspend'
+COMPAT_BACKEND="$COMPAT_DIR/backend"
+HELPER_DIR='/usr/local/libexec/com.custom.suspend'
+HELPER="$HELPER_DIR/suspend-helper"
+INSTALLER="$HELPER_DIR/suspend-installer"
+POLICY_DIR='/usr/share/polkit-1/actions'
+POLICY="$POLICY_DIR/com.custom.suspend.policy"
+SHARE_DIR='/usr/local/share/com.custom.suspend'
+RULE_SOURCE="$SHARE_DIR/suspend-sleep.rules"
+RULE='/etc/polkit-1/rules.d/00-com.custom.suspend.rules'
+STATE_DIR='/var/lib/com.custom.suspend'
+ICON_DIR='/usr/share/icons/hicolor/scalable/apps'
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+PM=""
+for candidate in pacman apt-get dnf yum zypper apk xbps-install emerge; do
+    if have "$candidate"; then
+        PM="$candidate"
+        break
+    fi
+done
+
+pkg_for() {
+    case "$1:$PM" in
+        polkit:pacman|polkit:dnf|polkit:yum|polkit:zypper|polkit:apk|polkit:xbps-install)
+            echo polkit ;;
+        polkit:apt-get)
+            if apt-cache show pkexec >/dev/null 2>&1; then
+                echo "polkitd pkexec"
+            else
+                echo policykit-1
+            fi
+            ;;
+        polkit:emerge) echo sys-auth/polkit ;;
+
+        agent:pacman|agent:xbps-install) echo polkit-kde-agent ;;
+        agent:apt-get|agent:apk) echo polkit-kde-agent-1 ;;
+        agent:dnf|agent:yum) echo polkit-kde ;;
+        agent:zypper) echo polkit-kde-agent-6 ;;
+        agent:emerge) echo kde-plasma/polkit-kde-agent ;;
+
+        *) echo "" ;;
+    esac
+}
+
+find_agent() {
+    local f
+
+    for f in \
+        /usr/lib/polkit-kde-authentication-agent-1 \
+        /usr/lib64/polkit-kde-authentication-agent-1 \
+        /usr/libexec/polkit-kde-authentication-agent-1 \
+        /usr/libexec/kf6/polkit-kde-authentication-agent-1 \
+        /usr/lib/kf6/polkit-kde-authentication-agent-1 \
+        /usr/lib/*/libexec/polkit-kde-authentication-agent-1 \
+        /usr/lib/*/polkit-kde-authentication-agent-1 \
+        /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1 \
+        /usr/libexec/polkit-gnome-authentication-agent-1 \
+        /usr/lib/mate-polkit/polkit-mate-authentication-agent-1
+    do
+        [[ -x "$f" ]] && return 0
+    done
+
+    have lxqt-policykit-agent && return 0
+    have lxpolkit && return 0
+
+    pgrep -f 'polkit.*authentication.*agent|policykit-agent' \
+        >/dev/null 2>&1
+}
+
+# True once the Polkit policy and the fixed-path installer are on the
+# system. Only then can pkexec show the clear Suspend widget message.
+friendly_prompt_ready() {
+    [[ -x "$INSTALLER" && -f "$POLICY" ]] &&
+        grep -q 'com.custom.suspend.install' "$POLICY"
+}
+
+# --------------------------------------------------------------------
+# Privilege escalation for the terminal flow: sudo, doas or su
+# --------------------------------------------------------------------
+
+ESC=""
+for tool in sudo doas su; do
+    if have "$tool"; then
+        ESC="$tool"
+        break
+    fi
+done
+
+root() {
+    case "$ESC" in
+        sudo) sudo "$@" ;;
+        doas) doas "$@" ;;
+        su)
+            local cmd
+            printf -v cmd '%q ' "$@"
+            su -c "$cmd" root
+            ;;
+        *)
+            echo "None of sudo, doas or su was found." >&2
+            return 1
+            ;;
+    esac
+}
+
+install_pkgs() {
+    case "$PM" in
+        pacman) root pacman -S --needed --noconfirm "$@" ;;
+        apt-get)
+            root apt-get update
+            root apt-get install -y "$@"
+            ;;
+        dnf) root dnf install -y "$@" ;;
+        yum) root yum install -y "$@" ;;
+        zypper) root zypper --non-interactive install "$@" ;;
+        apk) root apk add "$@" ;;
+        xbps-install) root xbps-install -Sy "$@" ;;
+        emerge) root emerge --noreplace "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+pause() {
+    read -r -p "Press Enter to close this window..." _ || true
+}
+
+# --------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------
+
+# Run pkexec so that the desktop's graphical authentication agent is used,
+# even when this was started from a terminal. Without this, pkexec falls
+# back to a text prompt on the inherited terminal and fails with
+# "unexpected EOF while reading from controlling terminal".
+exec_pkexec() {
+    local help
+    help="$(pkexec --help 2>&1 || true)"
+
+    if [[ "$help" == *--disable-internal-agent* ]]; then
+        exec pkexec --disable-internal-agent "$@" </dev/null
+    fi
+
+    if command -v setsid >/dev/null 2>&1; then
+        help="$(setsid --help 2>&1 || true)"
+        if [[ "$help" == *--wait* ]]; then
+            exec setsid --wait pkexec "$@" </dev/null
+        fi
+    fi
+
+    exec pkexec "$@" </dev/null
+}
+
+cmd_check() {
+    local src="$PKGDIR/contents/scripts" files=0 pkgs=()
+
+    same() {
+        [[ -e "$1" ]] || return 1
+        [[ -f "$2" ]] || return 0
+        cmp -s "$1" "$2"
+    }
+
+    same "$BACKEND" "$src/suspend-backend" || files=1
+    same "$HELPER" "$src/suspend-helper" || files=1
+    same "$INSTALLER" "$src/suspend-installer" || files=1
+    same "$POLICY" "$src/com.custom.suspend.policy" || files=1
+    same "$RULE_SOURCE" "$src/suspend-sleep.rules" || files=1
+    [[ -x "$BACKEND" && -x "$HELPER" && -x "$INSTALLER" ]] || files=1
+
+    if ! have pkexec; then
+        echo "missing:pkexec"
+        # shellcheck disable=SC2207
+        pkgs+=($(pkg_for polkit))
+    fi
+
+    (( files )) && echo "missing:files"
+
+    if ! find_agent; then
+        echo "missing:agent"
+        # shellcheck disable=SC2207
+        pkgs+=($(pkg_for agent))
+    fi
+
+    if friendly_prompt_ready; then
+        echo "prompt:friendly"
+    else
+        echo "prompt:generic"
+    fi
+
+    echo "pm:$PM"
+    echo "pkgs:${pkgs[*]:-}"
+}
+
+cmd_install_root() {
+    set -e
+
+    [[ "$EUID" -eq 0 ]] || {
+        echo "install-root must run as root." >&2
+        exit 1
+    }
+
+    local src="$PKGDIR/contents/scripts" ui="$PKGDIR/contents/ui" state
+
+    for f in "$src/suspend-backend" "$src/suspend-helper" \
+             "$src/suspend-installer" \
+             "$src/com.custom.suspend.policy" "$src/suspend-sleep.rules"; do
+        [[ -f "$f" ]] || { echo "Missing bundled file: $f" >&2; exit 1; }
+    done
+
+    install -d -m 755 /usr/local/bin "$COMPAT_DIR" "$HELPER_DIR" \
+        "$SHARE_DIR" "$STATE_DIR" "$POLICY_DIR" "$ICON_DIR"
+
+    install -D -m 755 "$src/suspend-backend" "$BACKEND"
+    install -D -m 755 "$src/suspend-helper" "$HELPER"
+    install -D -m 755 "$src/suspend-installer" "$INSTALLER"
+    install -D -m 644 "$src/com.custom.suspend.policy" "$POLICY"
+    install -D -m 644 "$src/suspend-sleep.rules" "$RULE_SOURCE"
+    ln -sfn "$BACKEND" "$COMPAT_BACKEND"
+
+    if [[ -f "$RULE" ]]; then state=on; else state=off; fi
+    printf '%s\n' "$state" > "$STATE_DIR/state"
+    chmod 644 "$STATE_DIR/state"
+
+    if [[ -f "$ui/suspend-widget-on.svg" ]]; then
+        install -m 644 "$ui/suspend-widget-on.svg" \
+            "$ICON_DIR/suspend-widget-on.svg"
+        install -m 644 "$ui/suspend-widget-on.svg" \
+            "$ICON_DIR/com.custom.suspend.svg"
+
+        if have gtk-update-icon-cache; then
+            gtk-update-icon-cache -f -t /usr/share/icons/hicolor \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+cmd_install() {
+    if ! have pkexec; then
+        echo "Polkit (pkexec) is not installed. Use \"Install in terminal\"." >&2
+        exit 5
+    fi
+
+    # Once the policy and the fixed-path installer are on the system,
+    # Polkit shows the clear "Suspend widget needs administrator access"
+    # message. The very first install has no policy yet, so it falls back
+    # to the generic pkexec prompt.
+    if friendly_prompt_ready; then
+        exec_pkexec "$INSTALLER" install-root "$PKGDIR"
+    fi
+
+    exec_pkexec "$(command -v bash)" "$SELF" install-root "$PKGDIR"
+}
+
+cmd_terminal_flow() {
+    local names="" pkgs=() agent_pkg reply
+
+    echo "=== Suspend widget setup ==="
+    echo "Suspend widget needs administrator access to install the"
+    echo "necessary packages and files."
+    echo "Package manager:  ${PM:-none}"
+    echo "Administrator via: ${ESC:-none}"
+    echo
+
+    if ! have pkexec; then
+        if [[ -z "$PM" ]]; then
+            echo "No supported package manager found. Install polkit (pkexec) manually."
+            pause
+            exit 1
+        fi
+
+        names="$(pkg_for polkit)"
+        read -ra pkgs <<< "$names"
+
+        echo "Required package missing: ${pkgs[*]}"
+        read -r -p "Install it with $PM (administrator access needed)? [Y/n] " reply || reply=n
+
+        if [[ -n "$reply" && "$reply" != [Yy]* ]]; then
+            echo "Cancelled."
+            pause
+            exit 1
+        fi
+
+        if ! install_pkgs "${pkgs[@]}"; then
+            echo "Package installation failed."
+            pause
+            exit 1
+        fi
+
+        hash -r
+    fi
+
+    if ! find_agent && [[ -n "$PM" ]]; then
+        agent_pkg="$(pkg_for agent)"
+
+        if [[ -n "$agent_pkg" ]]; then
+            echo
+            echo "No Polkit authentication agent found (needed for the password dialog)."
+            read -r -p "Try to install '$agent_pkg' with $PM? [Y/n] " reply || reply=n
+
+            if [[ -z "$reply" || "$reply" == [Yy]* ]]; then
+                read -ra pkgs <<< "$agent_pkg"
+                install_pkgs "${pkgs[@]}" ||
+                    echo "Could not install '$agent_pkg'. Install the KDE Polkit agent manually."
+            fi
+        fi
+    fi
+
+    echo
+    echo "Installing the Suspend backend and Polkit files..."
+
+    if root bash "$SELF" install-root "$PKGDIR"; then
+        echo
+        echo "Done. You can close this window."
+        pause
+    else
+        echo
+        echo "Installation failed."
+        pause
+        exit 1
+    fi
+}
+
+cmd_install_terminal() {
+    local term="" t
+
+    for t in konsole kitty alacritty foot wezterm xfce4-terminal \
+             gnome-terminal lxterminal xterm; do
+        if have "$t"; then
+            term="$t"
+            break
+        fi
+    done
+
+    if [[ -z "$term" ]]; then
+        echo "No terminal emulator found. Run in a terminal: bash '$SELF' terminal-flow '$PKGDIR'" >&2
+        exit 4
+    fi
+
+    case "$term" in
+        konsole)
+            exec konsole --nofork -e bash "$SELF" terminal-flow "$PKGDIR" ;;
+        gnome-terminal)
+            exec gnome-terminal --wait -- bash "$SELF" terminal-flow "$PKGDIR" ;;
+        xfce4-terminal)
+            exec xfce4-terminal --disable-server -x bash "$SELF" terminal-flow "$PKGDIR" ;;
+        wezterm)
+            exec wezterm start --always-new-process -- bash "$SELF" terminal-flow "$PKGDIR" ;;
+        kitty|foot)
+            exec "$term" bash "$SELF" terminal-flow "$PKGDIR" ;;
+        *)
+            exec "$term" -e bash "$SELF" terminal-flow "$PKGDIR" ;;
+    esac
+}
+
+# --------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------
+
+CMD="${1:-}"
+PKGDIR="${2:-}"
+
+case "$CMD" in
+    check|install|install-terminal|terminal-flow|install-root)
+        if [[ "$PKGDIR" != /* || ! -f "$PKGDIR/contents/scripts/suspend-backend" ]]; then
+            echo "Invalid package directory: $PKGDIR" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "Usage: suspend-setup check|install|install-terminal <pkgdir>" >&2
+        exit 2
+        ;;
+esac
+
+case "$CMD" in
+    check) cmd_check ;;
+    install) cmd_install ;;
+    install-terminal) cmd_install_terminal ;;
+    terminal-flow) cmd_terminal_flow ;;
+    install-root) cmd_install_root ;;
+esac
